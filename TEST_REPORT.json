@@ -1,0 +1,19 @@
+{
+  "project": "GPUVirtualWorkstation-v3.0-PseudoCPU-CUDA",
+  "version": "3.0.0",
+  "generated_utc": "2026-07-27T02:57:53.783464+00:00",
+  "python_syntax_compilation": "passed",
+  "unit_tests": "20 passed",
+  "zip_integrity": "passed",
+  "gui_runtime_test": "Not run in this build environment because PyQt6 is not installed here. Run setup_venv.ps1 and scripts/diagnose.py on Windows.",
+  "xmrig_cuda_runtime_test": "Not run because xmrig.exe, xmrig-cuda.dll, NVIDIA drivers, and the user's pool configuration are intentionally not bundled.",
+  "key_features": [
+    "Pseudo CPU on CUDA mode with logical GCPU lanes",
+    "Hybrid CPU + CUDA mode",
+    "Absolute isolated XMRig config paths",
+    "Explicit --cuda and --cuda-loader arguments",
+    "XMRig --dry-run preflight",
+    "CUDA failure and unexpected CPU fallback detection",
+    "Hybrid mode avoids one-core control-plane affinity"
+  ]
+}

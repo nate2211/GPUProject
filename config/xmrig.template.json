@@ -1,0 +1,55 @@
+{
+  "autosave": false,
+  "background": false,
+  "title": "GPU Virtual Workstation XMRig",
+  "randomx": {
+    "mode": "auto",
+    "1gb-pages": false,
+    "rdmsr": false,
+    "wrmsr": false,
+    "numa": false
+  },
+  "cpu": {
+    "enabled": false,
+    "huge-pages": false,
+    "yield": true,
+    "memory-pool": 0
+  },
+  "opencl": {
+    "enabled": false,
+    "cache": true
+  },
+  "cuda": {
+    "enabled": true,
+    "loader": "xmrig-cuda.dll",
+    "nvml": true
+  },
+  "api": {
+    "id": null,
+    "worker-id": null
+  },
+  "http": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 0,
+    "access-token": null,
+    "restricted": true
+  },
+  "pools": [
+    {
+      "algo": null,
+      "coin": null,
+      "url": "YOUR_POOL_HOST:PORT",
+      "user": "YOUR_WALLET_OR_USERNAME",
+      "pass": "x",
+      "rig-id": null,
+      "keepalive": true,
+      "enabled": true,
+      "tls": false
+    }
+  ],
+  "print-time": 10,
+  "health-print-time": 30,
+  "pause-on-battery": false,
+  "pause-on-active": false
+}

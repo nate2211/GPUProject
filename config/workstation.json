@@ -1,0 +1,13 @@
+{
+  "data_directory": "data/instances",
+  "gpu_refresh_ms": 5000,
+  "process_refresh_ms": 4000,
+  "api_poll_seconds": 5.0,
+  "default_backend": "pseudo_cuda",
+  "default_hard_gpu_only": true,
+  "default_priority": "idle",
+  "default_affinity": "",
+  "default_pin_workstation": false,
+  "default_guard_drop_percent": 4.0,
+  "default_eco_qos": false
+}
