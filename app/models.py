@@ -54,7 +54,13 @@ class InstanceSpec:
     opencl_devices: str = ""
     cuda_bfactor_hint: int | None = None
     cuda_bsleep_hint: int | None = None
+    cuda_tune_profile: str = "max"
+    cuda_threads: int = 32
+    cuda_blocks: int = 0
+    cuda_memory_reserve_mib: int = 1024
+    randomx_init_threads: int = 1
     force_dataset_vram: bool = True
+    native_isolation: bool = True
     pseudo_lane_count: int = 8
     preflight_dry_run: bool = True
     require_cuda_ready: bool = True

@@ -18,6 +18,9 @@ class WorkstationSettings:
     default_affinity: str = ""
     default_pin_workstation: bool = False
     default_guard_drop_percent: float = 4.0
+    default_cuda_tune_profile: str = "max"
+    default_randomx_init_threads: int = 1
+    default_native_isolation: bool = True
     config_path: Path | None = None
 
     @classmethod
@@ -41,6 +44,9 @@ class WorkstationSettings:
             "default_affinity",
             "default_pin_workstation",
             "default_guard_drop_percent",
+            "default_cuda_tune_profile",
+            "default_randomx_init_threads",
+            "default_native_isolation",
         }
         filtered = {key: value for key, value in data.items() if key in allowed}
         settings = cls(**filtered)

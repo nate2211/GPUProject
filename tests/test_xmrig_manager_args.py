@@ -45,6 +45,39 @@ class XmrigArgumentTests(unittest.TestCase):
         self.assertIn("--cuda", args)
         self.assertNotIn("--no-cpu", args)
 
+    def test_explicit_profile_keeps_bfactor_out_of_cli(self) -> None:
+        spec = InstanceSpec(
+            name="gpu",
+            xmrig_path=Path("xmrig.exe"),
+            source_config=Path("config.json"),
+            backend="cuda",
+            hard_gpu_only=True,
+            cuda_loader=Path("xmrig-cuda.dll"),
+            cuda_tune_profile="max",
+            cuda_bfactor_hint=0,
+            cuda_bsleep_hint=0,
+        )
+        args = build_xmrig_arguments(spec, Path("instance/config.json"))
+        self.assertFalse(any(arg.startswith("--cuda-bfactor-hint") for arg in args))
+        self.assertFalse(any(arg.startswith("--cuda-bsleep-hint") for arg in args))
+
+    def test_existing_profile_uses_cli_hints(self) -> None:
+        spec = InstanceSpec(
+            name="gpu",
+            xmrig_path=Path("xmrig.exe"),
+            source_config=Path("config.json"),
+            backend="cuda",
+            hard_gpu_only=True,
+            cuda_loader=Path("xmrig-cuda.dll"),
+            cuda_tune_profile="existing",
+            cuda_bfactor_hint=2,
+            cuda_bsleep_hint=5,
+        )
+        args = build_xmrig_arguments(spec, Path("instance/config.json"))
+        self.assertIn("--cuda-bfactor-hint=2", args)
+        self.assertIn("--cuda-bsleep-hint=5", args)
+
+
 
 if __name__ == "__main__":
     unittest.main()

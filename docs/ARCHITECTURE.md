@@ -3,9 +3,18 @@
 ```text
 PyQt6 MainWindow
   |
+  +-- Native GPU Virtual Machine
+  |     +-- ctypes ABI guard
+  |     +-- gpu_host_runtime.dll
+  |     +-- DXGI adapter selection
+  |     +-- D3D12 device + compute queue
+  |     +-- GVM shader pipeline
+  |     +-- GPU program/data resources
+  |     `-- fence, readback, status, self-test
+  |
   +-- GPU Monitor
   |     +-- NVML
-  |     +-- Optional DXGI C++ DLL
+  |     +-- Native DXGI C++ DLL
   |     `-- nvidia-smi fallback
   |
   +-- Existing-XMRig scanner
@@ -28,9 +37,33 @@ PyQt6 MainWindow
   `-- Restricted virtual terminal
 ```
 
-## Isolation boundaries
+## Native GPU virtual-machine boundary
 
-Each managed instance receives:
+The C++ DLL owns a persistent Direct3D 12 device, compute queue, allocator,
+command list, root signature, compute pipeline, descriptor heap, fence, and
+completion event. Each execution call:
+
+1. Validates the GVM program and 32-bit data buffer.
+2. Uploads the program and data to D3D12 resources.
+3. Transitions the program to shader-resource state and data to UAV state.
+4. Dispatches one shader lane per configured logical GVM lane.
+5. Inserts a UAV barrier and transitions data to copy-source state.
+6. Copies results to a readback resource.
+7. Signals and waits for a fence before returning data to Python.
+
+Calls are serialized per runtime handle. A configurable maximum-step count
+bounds shader loops.
+
+## Why the host CPU remains present
+
+Windows process loading, UI event dispatch, filesystem access, network sockets,
+and D3D12 command submission are host operations. The project minimizes this
+control plane but does not mislabel it as GPU execution. Only translated GVM or
+other native GPU kernels execute on the GPU.
+
+## XMRig isolation boundaries
+
+Each managed XMRig instance receives:
 
 - A unique workstation vPID.
 - A real Windows PID.
@@ -45,17 +78,16 @@ Each managed instance receives:
 The already-running CPU miner is read but never injected into, patched in memory,
 or changed by the application.
 
-## Protection model
+## XMRig protection model
 
 Protection has four layers:
 
 1. **Workload separation:** the child receives `--no-cpu` and a GPU backend.
-2. **Startup scheduling:** XMRig receives a CPU-affinity mask and idle-priority flag
-   in its own launch arguments.
+2. **Startup scheduling:** XMRig receives a low-impact control-plane policy.
 3. **Windows enforcement:** the manager reapplies affinity, priority, low I/O
-   priority, and EcoQoS after process creation.
-4. **Measured fallback:** the hashrate guard suspends or stops the GPU instance when
-   the protected CPU miner remains below its configured floor.
+   priority, and optional EcoQoS after process creation.
+4. **Measured fallback:** the hashrate guard suspends or stops the GPU instance
+   when the protected CPU miner remains below its configured floor.
 
 ## Core detection
 
@@ -68,14 +100,3 @@ The scanner prefers explicit mining-thread affinity over process affinity:
 
 Automatic `-1` XMRig thread affinities do not name exact logical CPUs and are not
 invented by the scanner.
-
-## Why no zero-impact guarantee exists
-
-A GPU miner still needs host threads and memory traffic. CPU and GPU may also share
-power and cooling limits. Affinity prevents direct scheduler overlap but cannot
-prevent platform-level thermal or power coupling. The hashrate guard therefore
-measures the outcome rather than assuming isolation is perfect.
-
-## Non-blocking isolation policy
-
-GPU-only enforcement is part of the generated XMRig configuration and command line. Windows affinity, priority, I/O priority, EcoQoS, and GUI pinning are scheduling hints. Failure to apply a hint is logged but never terminates XMRig.

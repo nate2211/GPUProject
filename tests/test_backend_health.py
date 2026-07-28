@@ -30,6 +30,19 @@ class BackendHealthTests(unittest.TestCase):
         self.assertIsNotNone(event)
         self.assertEqual(event.kind, "cuda_failed")
 
+    def test_dataset_init_is_not_cpu_mining(self) -> None:
+        event = classify_xmrig_line(
+            "[2026-07-27 23:43:03.700] randomx init dataset algo rx/0 (1 threads)"
+        )
+        self.assertIsNotNone(event)
+        self.assertEqual(event.kind, "dataset_init")
+
+    def test_cuda_compute_error_is_detected(self) -> None:
+        event = classify_xmrig_line("nvidia GPU #0 COMPUTE ERROR")
+        self.assertIsNotNone(event)
+        self.assertEqual(event.kind, "cuda_compute_error")
+
+
 
 if __name__ == "__main__":
     unittest.main()

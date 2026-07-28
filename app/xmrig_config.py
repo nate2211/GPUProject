@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from app.cuda_tuning import CudaRxProfile
 from app.models import CUDA_BACKENDS
 
 
@@ -53,6 +54,15 @@ def _force_randomx_dataset_to_vram(backend: dict[str, Any]) -> int:
     return changed
 
 
+def _install_cuda_rx_profile(cuda: dict[str, Any], profile: CudaRxProfile) -> None:
+    entry = profile.as_xmrig_json()
+    # XMRig commonly resolves rx/0 through the generic "rx" profile. Supplying
+    # both names also keeps an explicitly selected rx/0 pool from falling back to
+    # a stale source profile.
+    cuda["rx"] = [deepcopy(entry)]
+    cuda["rx/0"] = [deepcopy(entry)]
+
+
 def patch_xmrig_config(
     source: dict[str, Any],
     *,
@@ -66,6 +76,8 @@ def patch_xmrig_config(
     cuda_loader: Path | None = None,
     cuda_devices: str = "",
     opencl_devices: str = "",
+    randomx_init_threads: int = 1,
+    cuda_rx_profile: CudaRxProfile | None = None,
 ) -> dict[str, Any]:
     del cuda_devices, opencl_devices  # Device selection is applied with documented CLI flags.
 
@@ -110,6 +122,8 @@ def patch_xmrig_config(
         cuda["nvml"] = True
         if cuda_loader is not None:
             cuda["loader"] = cuda_loader.expanduser().resolve().as_posix()
+        if cuda_rx_profile is not None:
+            _install_cuda_rx_profile(cuda, cuda_rx_profile)
         opencl["enabled"] = False
     elif backend == "opencl":
         cpu["enabled"] = bool(keep_cpu and not hard_gpu_only)
@@ -119,17 +133,24 @@ def patch_xmrig_config(
         raise ValueError(f"Unsupported backend mode: {backend}")
 
     if hard_gpu_only:
+        # CPU hashing is disabled. The remaining CPU work is XMRig's network,
+        # CUDA driver control, and RandomX dataset initialization. Limit that
+        # startup work to the requested count and the process control affinity.
         cpu.update(
             {
                 "enabled": False,
                 "huge-pages": False,
+                "huge-pages-jit": False,
                 "memory-pool": 0,
                 "yield": True,
+                "priority": 0,
+                "max-threads-hint": 1,
             }
         )
         randomx = _ensure_object(config, "randomx")
         randomx.update(
             {
+                "init": max(1, int(randomx_init_threads)),
                 "rdmsr": False,
                 "wrmsr": False,
                 "numa": False,

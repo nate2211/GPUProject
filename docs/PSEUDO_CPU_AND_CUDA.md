@@ -1,46 +1,65 @@
-# Pseudo CPU and CUDA design
+# Pseudo CPU lanes and GPU execution
 
-## Execution boundary
+Version 4.0 contains two different lane concepts. The UI names them separately
+because they have different technical meaning.
+
+## Native GVM lanes
 
 ```text
-PyQt6 virtual workstation
+Python control plane
         |
-        +-- pseudo lane model (GCPU-00 ... GCPU-N)
+        `-- gpu_host_runtime.dll
+                |
+                `-- Direct3D 12 compute shader
+                        +-- GVM lane 0
+                        +-- GVM lane 1
+                        +-- ...
+                        `-- GVM lane N
+```
+
+Each GVM lane is a real compute-shader invocation. It has sixteen private
+32-bit virtual registers and executes the shared GVM instruction stream. Shared
+program and data buffers are GPU resources during execution.
+
+The host CPU still performs Windows-only control-plane work: loading the DLL,
+creating the D3D12 device, submitting command lists, waiting on the fence, and
+copying requested results back. The translated arithmetic/data kernel itself is
+executed by the GPU.
+
+## XMRig CUDA projections
+
+```text
+PyQt6 workstation
         |
-        +-- XMRig Windows process
+        +-- display projection (GCPU-00 ... GCPU-N)
+        |
+        `-- XMRig Windows process
                 |
                 +-- CPU backend -> physical x86 CPU threads
-                |
                 `-- CUDA backend -> xmrig-cuda.dll -> NVIDIA GPU
 ```
 
-The pseudo lane model is a control and visualization abstraction over CUDA. It
-cannot redirect XMRig CPU JIT instructions to the GPU.
+These rows divide XMRig's total reported CUDA hashrate evenly for visualization.
+They are not individually measured threads and do not redirect XMRig's CPU JIT
+to the native GVM.
 
-## Why the distinction matters
+## Why arbitrary executables still cannot move to GPU lanes
 
-XMRig's CPU configuration defines native CPU mining threads and CPU affinity.
-CUDA is a separate plugin backend. Turning both on creates a hybrid miner, not a
-GPU-emulated CPU.
+A Windows executable uses x86-64 machine instructions and Windows system calls.
+A D3D12/CUDA/OpenCL GPU executes a different instruction set and cannot invoke
+Windows services directly. Running an application on the GVM therefore requires
+translation of its parallel kernels or a purpose-built GPU backend.
 
-## Pseudo lane calculations
+This is the same architectural boundary used by production GPU applications:
+CPU control flow coordinates GPU command buffers, while data-parallel kernels
+run on GPU execution units.
 
-The UI divides the total 10-second CUDA-instance hashrate evenly across the
-configured number of logical lanes. That per-lane value is an estimate for
-visualization, not a measurement exported by XMRig.
+## XMRig backend safety checks
 
-## Backend safety checks
-
-GPU-only and pseudo-CPU modes watch startup output. The manager stops the
-instance when:
+GPU-only and pseudo-CUDA XMRig modes continue to watch startup output. The
+manager stops an instance when:
 
 - CUDA is required but the plugin/backend fails.
 - XMRig starts a real CPU mining profile despite GPU-only mode.
 
-Hybrid mode allows real CPU mining and reports that state explicitly.
-
-## Future custom backend work
-
-A true custom GPU virtual-machine backend would require an XMRig source fork or
-separate miner backend implementing RandomX on CUDA. It would still be a CUDA
-backend; it would not make the stock XMRig CPU backend run on the GPU.
+Hybrid mode explicitly allows physical CPU mining and reports that state.

@@ -12,13 +12,22 @@ import psutil
 from PyQt6.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, pyqtSignal
 
 from app.backend_health import classify_xmrig_line
+from app.cuda_tuning import (
+    parse_cuda_device_indexes,
+    query_nvidia_gpus,
+    select_gpu_info,
+    tune_cuda_rx_profile,
+)
 from app.hashrate_guard import HashrateGuard
 from app.isolation import (
     apply_process_isolation,
+    discover_xmrig_processes,
     format_cpu_list,
     priority_name,
+    recommend_control_cores,
 )
 from app.models import CUDA_BACKENDS, InstanceMetrics, InstanceSnapshot, InstanceSpec, InstanceState
+from app.native_isolation_bridge import NativeIsolationError, NativeProcessIsolationBridge
 from app.settings import WorkstationSettings
 from app.xmrig_api import ApiPoller
 from app.xmrig_config import (
@@ -71,6 +80,7 @@ class XmrigManager(QObject):
         self.settings = settings
         self._instances: dict[int, ManagedInstance] = {}
         self._next_virtual_pid = 1000
+        self._native_isolation = NativeProcessIsolationBridge()
 
     @property
     def instances(self) -> Iterable[ManagedInstance]:
@@ -96,6 +106,41 @@ class XmrigManager(QObject):
         self._validate_spec(spec)
         preflight_warnings = self._backend_preflight_warnings(spec, source)
 
+        if spec.hard_gpu_only and not spec.cpu_affinity:
+            excluded = {item.host_pid for item in self._instances.values() if item.host_pid > 0}
+            external = discover_xmrig_processes(excluded)
+            cores, shared, recommendation = recommend_control_cores(external, count=1)
+            spec.cpu_affinity = cores
+            preflight_warnings.append(
+                ("Shared control CPU selected: " if shared else "Auto-selected control CPU: ")
+                + recommendation
+            )
+
+        cuda_rx_profile = None
+        selected_gpu = None
+        if spec.backend in CUDA_BACKENDS:
+            device_index = parse_cuda_device_indexes(spec.cuda_devices)[0]
+            selected_gpu = select_gpu_info(query_nvidia_gpus(), device_index)
+            cuda_rx_profile = tune_cuda_rx_profile(
+                device_index=device_index,
+                gpu=selected_gpu,
+                preset=spec.cuda_tune_profile,
+                threads=spec.cuda_threads,
+                blocks_override=spec.cuda_blocks,
+                memory_reserve_mib=spec.cuda_memory_reserve_mib,
+                affinity=spec.cpu_affinity[0] if spec.cpu_affinity else -1,
+                bfactor_override=spec.cuda_bfactor_hint,
+                bsleep_override=spec.cuda_bsleep_hint,
+            )
+            if cuda_rx_profile is not None:
+                gpu_name = selected_gpu.name if selected_gpu is not None else f"CUDA device {device_index}"
+                preflight_warnings.append(
+                    f"CUDA RX {spec.cuda_tune_profile} profile for {gpu_name}: "
+                    f"threads={cuda_rx_profile.threads}, blocks={cuda_rx_profile.blocks}, "
+                    f"intensity={cuda_rx_profile.intensity}, BF={cuda_rx_profile.bfactor}, "
+                    f"BS={cuda_rx_profile.bsleep}, VRAM≈{cuda_rx_profile.memory_mib} MiB."
+                )
+
         patched = patch_xmrig_config(
             source,
             instance_name=spec.name,
@@ -108,6 +153,8 @@ class XmrigManager(QObject):
             cuda_loader=spec.cuda_loader,
             cuda_devices=spec.cuda_devices,
             opencl_devices=spec.opencl_devices,
+            randomx_init_threads=spec.randomx_init_threads,
+            cuda_rx_profile=cuda_rx_profile,
         )
         if patched.get("log-file"):
             patched["log-file"] = str((instance_dir / "xmrig.log").resolve())
@@ -184,10 +231,22 @@ class XmrigManager(QObject):
             "require_cuda_ready": spec.require_cuda_ready,
             "abort_on_cpu_fallback": spec.abort_on_cpu_fallback,
             "hard_gpu_only": spec.hard_gpu_only,
+            "randomx_init_threads": spec.randomx_init_threads,
+            "cuda_tune_profile": spec.cuda_tune_profile,
+            "cuda_rx_profile": cuda_rx_profile.as_xmrig_json() if cuda_rx_profile else None,
+            "detected_gpu": {
+                "index": selected_gpu.index,
+                "name": selected_gpu.name,
+                "total_memory_mib": selected_gpu.total_memory_mib,
+                "free_memory_mib": selected_gpu.free_memory_mib,
+                "multiprocessors": selected_gpu.multiprocessors,
+            } if selected_gpu else None,
             "requested_cpu_affinity": spec.cpu_affinity,
             "requested_priority": spec.priority,
             "eco_qos": spec.eco_qos,
             "pin_workstation": spec.pin_workstation,
+            "native_isolation": spec.native_isolation,
+            "native_isolation_dll": str(self._native_isolation.loaded_path) if self._native_isolation.loaded_path else None,
             "preflight_warnings": preflight_warnings,
             "preflight_output_file": str(instance_dir / "preflight.log") if preflight_output else None,
             "console_log": str(instance_dir / "console.log"),
@@ -267,6 +326,14 @@ class XmrigManager(QObject):
             raise ValueError("Pseudo lane count must be between 1 and 128.")
         if spec.hard_gpu_only and spec.backend not in {"cuda", "pseudo_cuda", "opencl"}:
             raise ValueError("Hard GPU-only mode requires the CUDA or OpenCL backend.")
+        if not 1 <= spec.randomx_init_threads <= 64:
+            raise ValueError("RandomX initialization threads must be between 1 and 64.")
+        if not 1 <= spec.cuda_threads <= 1024:
+            raise ValueError("CUDA threads must be between 1 and 1024.")
+        if spec.cuda_blocks < 0:
+            raise ValueError("CUDA blocks cannot be negative.")
+        if spec.cuda_memory_reserve_mib < 256:
+            raise ValueError("Reserve at least 256 MiB of GPU memory.")
         if spec.protected_api_url and spec.protected_baseline_hs <= 0:
             raise ValueError("Capture a positive CPU-miner baseline before enabling the guard.")
 
@@ -310,6 +377,32 @@ class XmrigManager(QObject):
     def _inspect_backend_line(self, instance: ManagedInstance, line: str) -> None:
         event = classify_xmrig_line(line)
         if event is None:
+            return
+
+        if event.kind == "dataset_init":
+            instance.backend_health = "RandomX dataset init on reserved CPU"
+            self.log_line.emit(
+                instance.name,
+                f"[isolation] RandomX dataset setup is control-plane work, not CPU hashing; "
+                f"it is limited to {instance.spec.randomx_init_threads} init thread(s) and affinity "
+                f"{format_cpu_list(instance.spec.cpu_affinity) or 'system default'}.",
+            )
+            self.instance_changed.emit()
+            return
+
+        if event.kind == "dataset_ready":
+            instance.backend_health = "Dataset ready; waiting for CUDA"
+            self.instance_changed.emit()
+            return
+
+        if event.kind == "cuda_compute_error":
+            instance.backend_health = "CUDA compute error"
+            instance.last_error = event.detail
+            self.log_line.emit(
+                instance.name,
+                "[backend] CUDA compute error detected. Reduce CUDA blocks or select the Fast/Compatibility preset.",
+            )
+            self.instance_changed.emit()
             return
 
         if event.kind in {"cuda_enabled", "cuda_ready"}:
@@ -356,17 +449,45 @@ class XmrigManager(QObject):
             return
         instance.host_pid = int(instance.process.processId())
 
-        # Scheduling controls are intentionally best-effort. The CPU backend is
-        # already disabled in both config.json and the --no-cpu launch flag, so an
-        # affinity/EcoQoS failure must not kill an otherwise valid GPU miner.
+        # Apply the native isolation DLL first. It briefly suspends the child,
+        # installs affinity/priority/EcoQoS, attaches a persistent Job Object,
+        # and resumes it before RandomX dataset initialization normally begins.
+        # Python/psutil remains as a compatibility fallback and sets I/O priority.
         process_affinity = [] if instance.spec.backend == "hybrid_cuda" else instance.spec.cpu_affinity
-        applied = apply_process_isolation(
-            instance.host_pid,
-            process_affinity,
-            instance.spec.priority,
-            eco_qos=instance.spec.eco_qos,
-            strict=False,
-        )
+        applied: list[str] = []
+        if instance.spec.native_isolation and self._native_isolation.available:
+            try:
+                applied.append(
+                    self._native_isolation.apply(
+                        instance.host_pid,
+                        process_affinity,
+                        instance.spec.priority,
+                        eco_qos=instance.spec.eco_qos,
+                        suspend_during_apply=True,
+                    )
+                )
+                applied.extend(
+                    apply_process_isolation(
+                        instance.host_pid,
+                        [],
+                        instance.spec.priority,
+                        very_low_io=True,
+                        eco_qos=False,
+                        strict=False,
+                    )
+                )
+            except (NativeIsolationError, OSError, ValueError) as exc:
+                applied.append(f"warning: native isolation unavailable ({exc})")
+        if not applied or all(item.startswith("warning:") for item in applied):
+            applied.extend(
+                apply_process_isolation(
+                    instance.host_pid,
+                    process_affinity,
+                    instance.spec.priority,
+                    eco_qos=instance.spec.eco_qos,
+                    strict=False,
+                )
+            )
         instance.isolation_status = ", ".join(applied)
 
         if instance.spec.pin_workstation:
@@ -512,6 +633,7 @@ class XmrigManager(QObject):
             return
         was_stopping = instance.state == InstanceState.STOPPING
         self._stop_instance_threads(instance)
+        self._native_isolation.release(instance.host_pid)
         instance.exit_code = exit_code
         instance.state = InstanceState.EXITED if exit_code == 0 else InstanceState.FAILED
         self.log_line.emit(instance.name, f"[workstation] Process exited with code {exit_code}.")
@@ -572,16 +694,34 @@ class XmrigManager(QObject):
 
     def set_priority(self, pid: int, level: str) -> None:
         instance = self._require_running(pid)
-        apply_process_isolation(instance.host_pid, [], level, eco_qos=instance.spec.eco_qos)
+        if instance.spec.native_isolation and self._native_isolation.available:
+            self._native_isolation.apply(
+                instance.host_pid,
+                instance.spec.cpu_affinity,
+                level,
+                eco_qos=instance.spec.eco_qos,
+                suspend_during_apply=True,
+            )
+        else:
+            apply_process_isolation(instance.host_pid, [], level, eco_qos=instance.spec.eco_qos)
         instance.spec.priority = level
         self.log_line.emit(instance.name, f"[workstation] Priority set to {level}.")
         self.instance_changed.emit()
 
     def set_affinity(self, pid: int, cores: list[int]) -> None:
         instance = self._require_running(pid)
-        apply_process_isolation(
-            instance.host_pid, cores, instance.spec.priority, eco_qos=instance.spec.eco_qos
-        )
+        if instance.spec.native_isolation and self._native_isolation.available:
+            self._native_isolation.apply(
+                instance.host_pid,
+                cores,
+                instance.spec.priority,
+                eco_qos=instance.spec.eco_qos,
+                suspend_during_apply=True,
+            )
+        else:
+            apply_process_isolation(
+                instance.host_pid, cores, instance.spec.priority, eco_qos=instance.spec.eco_qos
+            )
         instance.spec.cpu_affinity = list(cores)
         self.log_line.emit(
             instance.name,

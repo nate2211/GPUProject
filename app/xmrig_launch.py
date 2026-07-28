@@ -19,10 +19,13 @@ def build_xmrig_arguments(spec: InstanceSpec, config_path: Path) -> list[str]:
             arguments.append(f"--cuda-loader={spec.cuda_loader.expanduser().resolve()}")
         if spec.cuda_devices.strip():
             arguments.append(f"--cuda-devices={spec.cuda_devices.strip()}")
-        if spec.cuda_bfactor_hint is not None:
-            arguments.append(f"--cuda-bfactor-hint={int(spec.cuda_bfactor_hint)}")
-        if spec.cuda_bsleep_hint is not None:
-            arguments.append(f"--cuda-bsleep-hint={int(spec.cuda_bsleep_hint)}")
+        # Preset/explicit RX profiles carry BF/BS in config.json. CLI hints are
+        # only useful when the user deliberately keeps XMRig autoconfiguration.
+        if spec.cuda_tune_profile == "existing":
+            if spec.cuda_bfactor_hint is not None:
+                arguments.append(f"--cuda-bfactor-hint={int(spec.cuda_bfactor_hint)}")
+            if spec.cuda_bsleep_hint is not None:
+                arguments.append(f"--cuda-bsleep-hint={int(spec.cuda_bsleep_hint)}")
     elif spec.backend == "opencl":
         arguments.append("--opencl")
         if spec.opencl_devices.strip():

@@ -7,13 +7,17 @@
     "1gb-pages": false,
     "rdmsr": false,
     "wrmsr": false,
-    "numa": false
+    "numa": false,
+    "init": 1
   },
   "cpu": {
     "enabled": false,
     "huge-pages": false,
     "yield": true,
-    "memory-pool": 0
+    "memory-pool": 0,
+    "priority": 0,
+    "max-threads-hint": 1,
+    "huge-pages-jit": false
   },
   "opencl": {
     "enabled": false,

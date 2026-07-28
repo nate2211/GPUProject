@@ -1,0 +1,21 @@
+{
+  "schema": "gvm-program-v1",
+  "name": "Lane affine transform",
+  "runtime": {
+    "lanes": 4096,
+    "max_steps_per_lane": 64
+  },
+  "data": {
+    "words": 4096,
+    "fill": 0
+  },
+  "preview_words": 16,
+  "instructions": [
+    {"op": "MOV_LANE", "dst": 0},
+    {"op": "MOV_IMM", "dst": 1, "immediate": 7},
+    {"op": "MUL_LO", "dst": 2, "src_a": 0, "src_b": 1},
+    {"op": "ADD_IMM", "dst": 2, "src_a": 2, "immediate": 11},
+    {"op": "STORE", "src_a": 0, "src_b": 2},
+    {"op": "HALT"}
+  ]
+}

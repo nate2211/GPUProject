@@ -9,5 +9,8 @@
   "default_affinity": "",
   "default_pin_workstation": false,
   "default_guard_drop_percent": 4.0,
-  "default_eco_qos": false
+  "default_eco_qos": false,
+  "default_cuda_tune_profile": "max",
+  "default_randomx_init_threads": 1,
+  "default_native_isolation": true
 }

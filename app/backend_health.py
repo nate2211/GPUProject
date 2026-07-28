@@ -28,6 +28,13 @@ def classify_xmrig_line(line: str) -> BackendEvent | None:
     if any(marker in normalized for marker in cuda_failure_markers):
         return BackendEvent("cuda_failed", line.strip())
 
+    if "randomx init dataset" in normalized:
+        return BackendEvent("dataset_init", line.strip())
+    if "randomx dataset ready" in normalized:
+        return BackendEvent("dataset_ready", line.strip())
+    if "gpu #" in normalized and "compute error" in normalized:
+        return BackendEvent("cuda_compute_error", line.strip())
+
     if "* cuda" in normalized and "enabled" in normalized:
         return BackendEvent("cuda_enabled", line.strip())
     padded = f" {normalized} "

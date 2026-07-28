@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shlex
+from datetime import datetime
 from pathlib import Path
 
 from PyQt6.QtCore import QProcess, QTimer, Qt
@@ -33,7 +34,9 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from app.gpu_compute_runtime import GpuVirtualMachine
 from app.gpu_monitor import GpuMonitor
+from app.gvm_program import GvmProgram
 from app.isolation import (
     ExternalXmrigProcess,
     assess_isolation,
@@ -90,6 +93,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("GPU Virtual Workstation — Isolated XMRig Host")
 
         self.gpu_monitor = GpuMonitor()
+        self.gpu_vm = GpuVirtualMachine()
         self.manager = XmrigManager(settings)
         self.process_model = ProcessTableModel()
         self._last_gpus: list[GpuDevice] = []
@@ -252,17 +256,45 @@ class MainWindow(QMainWindow):
         self.opencl_devices = QLineEdit("0")
         self.opencl_devices.setPlaceholderText("Comma-separated OpenCL devices, usually 0")
 
+        self.cuda_tune_profile = QComboBox()
+        self.cuda_tune_profile.addItem("Maximum throughput — BF 0 / BS 0", "max")
+        self.cuda_tune_profile.addItem("Fast — BF 2 / BS 0", "fast")
+        self.cuda_tune_profile.addItem("Balanced — BF 4 / BS 10", "balanced")
+        self.cuda_tune_profile.addItem("Compatibility — BF 6 / BS 25", "compat")
+        self.cuda_tune_profile.addItem("Keep existing XMRig profile/autoconfig", "existing")
+        tune_index = self.cuda_tune_profile.findData(self.settings.default_cuda_tune_profile)
+        self.cuda_tune_profile.setCurrentIndex(max(0, tune_index))
+
+        self.cuda_threads = QSpinBox()
+        self.cuda_threads.setRange(1, 1024)
+        self.cuda_threads.setValue(32)
+        self.cuda_blocks = QSpinBox()
+        self.cuda_blocks.setRange(0, 65535)
+        self.cuda_blocks.setValue(0)
+        self.cuda_blocks.setSpecialValueText("Auto from SM/VRAM")
+        self.cuda_memory_reserve = QSpinBox()
+        self.cuda_memory_reserve.setRange(256, 16384)
+        self.cuda_memory_reserve.setSingleStep(256)
+        self.cuda_memory_reserve.setValue(1024)
+        self.cuda_memory_reserve.setSuffix(" MiB")
+
         self.cuda_bfactor = QSpinBox()
         self.cuda_bfactor.setRange(-1, 12)
         self.cuda_bfactor.setValue(-1)
-        self.cuda_bfactor.setSpecialValueText("Auto")
-        self.force_dataset_vram = QCheckBox("Keep RandomX dataset in GPU VRAM when an existing RX profile is present")
+        self.cuda_bfactor.setSpecialValueText("Preset")
+        self.force_dataset_vram = QCheckBox("Keep RandomX CUDA dataset in GPU VRAM")
         self.force_dataset_vram.setChecked(True)
 
         self.cuda_bsleep = QSpinBox()
         self.cuda_bsleep.setRange(-1, 1000)
         self.cuda_bsleep.setValue(-1)
-        self.cuda_bsleep.setSpecialValueText("Auto")
+        self.cuda_bsleep.setSpecialValueText("Preset")
+
+        self.randomx_init_threads = QSpinBox()
+        self.randomx_init_threads.setRange(1, 64)
+        self.randomx_init_threads.setValue(self.settings.default_randomx_init_threads)
+        self.native_isolation = QCheckBox("Use native C++ isolation DLL before RandomX dataset initialization")
+        self.native_isolation.setChecked(self.settings.default_native_isolation)
 
         self.pseudo_lanes = QSpinBox()
         self.pseudo_lanes.setRange(1, 128)
@@ -286,8 +318,14 @@ class MainWindow(QMainWindow):
         form.addRow("CUDA plugin", cuda_loader_row)
         form.addRow("CUDA devices", self.cuda_devices)
         form.addRow("OpenCL devices", self.opencl_devices)
-        form.addRow("CUDA bfactor hint", self.cuda_bfactor)
-        form.addRow("CUDA bsleep hint", self.cuda_bsleep)
+        form.addRow("CUDA tuning preset", self.cuda_tune_profile)
+        form.addRow("CUDA threads", self.cuda_threads)
+        form.addRow("CUDA blocks", self.cuda_blocks)
+        form.addRow("GPU memory reserve", self.cuda_memory_reserve)
+        form.addRow("CUDA bfactor override", self.cuda_bfactor)
+        form.addRow("CUDA bsleep override", self.cuda_bsleep)
+        form.addRow("RandomX init CPU threads", self.randomx_init_threads)
+        form.addRow("", self.native_isolation)
         form.addRow("Pseudo CPU lanes", self.pseudo_lanes)
         form.addRow("", self.preflight_dry_run)
         form.addRow("", self.require_cuda_ready)
@@ -453,10 +491,60 @@ class MainWindow(QMainWindow):
     def _create_pseudo_cpu_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.addWidget(section_title("GPU-backed pseudo CPU lanes"))
+        layout.addWidget(section_title("Native GPU virtual-machine lanes"))
         layout.addWidget(
             muted(
-                "These are logical CUDA worker lanes used by the workstation UI. They divide XMRig's reported CUDA hashrate for display only; they are not x86 threads and do not run XMRig's CPU JIT on the GPU."
+                "The native C++ DLL now creates a persistent Direct3D 12 compute runtime and executes a compact virtual instruction set inside GPU shaders. "
+                "This provides real GPU-backed arithmetic lanes for translated numeric workloads. It does not claim that arbitrary x86 Windows executables can run unchanged on a GPU."
+            )
+        )
+
+        native_group = QGroupBox("C++ DLL / Direct3D 12 compute engine")
+        native_layout = QVBoxLayout(native_group)
+        native_form = QFormLayout()
+        self.gvm_adapter = QSpinBox()
+        self.gvm_adapter.setRange(0, 63)
+        self.gvm_adapter.setValue(0)
+        self.gvm_lanes = QSpinBox()
+        self.gvm_lanes.setRange(1, 1_048_576)
+        self.gvm_lanes.setValue(4096)
+        self.gvm_lanes.setSingleStep(1024)
+        self.gvm_steps = QSpinBox()
+        self.gvm_steps.setRange(1, 1_048_576)
+        self.gvm_steps.setValue(65_536)
+        self.gvm_status = QLabel()
+        self.gvm_status.setWordWrap(True)
+        native_form.addRow("DXGI adapter index", self.gvm_adapter)
+        native_form.addRow("GPU virtual lanes", self.gvm_lanes)
+        native_form.addRow("Maximum instructions per lane", self.gvm_steps)
+        native_layout.addLayout(native_form)
+        native_layout.addWidget(self.gvm_status)
+
+        native_buttons = QHBoxLayout()
+        initialize = QPushButton("Initialize native GPU engine")
+        initialize.setObjectName("Primary")
+        initialize.clicked.connect(self._initialize_native_runtime)
+        self_test = QPushButton("Run GPU self-test")
+        self_test.clicked.connect(self._run_native_self_test)
+        demo = QPushButton("Run lane demo")
+        demo.clicked.connect(self._run_native_lane_demo)
+        run_program = QPushButton("Run .gvm.json program…")
+        run_program.clicked.connect(self._browse_and_run_gvm_program)
+        shutdown = QPushButton("Shutdown engine")
+        shutdown.clicked.connect(self._shutdown_native_runtime)
+        native_buttons.addWidget(initialize)
+        native_buttons.addWidget(self_test)
+        native_buttons.addWidget(demo)
+        native_buttons.addWidget(run_program)
+        native_buttons.addWidget(shutdown)
+        native_buttons.addStretch(1)
+        native_layout.addLayout(native_buttons)
+        layout.addWidget(native_group)
+
+        layout.addWidget(section_title("XMRig CUDA lane projections"))
+        layout.addWidget(
+            muted(
+                "The table below remains an XMRig telemetry projection. Unlike the native engine above, these rows divide XMRig's total CUDA hashrate for display and are not individually measured execution contexts."
             )
         )
         self.pseudo_table = QTableWidget(0, 7)
@@ -467,7 +555,140 @@ class MainWindow(QMainWindow):
         self.pseudo_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.pseudo_table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.pseudo_table, 1)
+        self._refresh_native_runtime_status()
         return page
+
+    def _initialize_native_runtime(self) -> None:
+        try:
+            self.gpu_vm.start(
+                adapter_index=self.gvm_adapter.value(),
+                lane_count=self.gvm_lanes.value(),
+                max_steps_per_lane=self.gvm_steps.value(),
+            )
+            snapshot = self.gpu_vm.status()
+            self.console.appendPlainText(
+                f"[gvm] Native D3D12 runtime started on {snapshot.adapter_name} with "
+                f"{snapshot.lane_count:,} GPU lanes."
+            )
+            self._refresh_native_runtime_status()
+        except Exception as exc:
+            self._refresh_native_runtime_status(str(exc))
+            QMessageBox.critical(self, "Native GPU engine failed", str(exc))
+
+    def _run_native_self_test(self) -> None:
+        try:
+            report = self.gpu_vm.self_test(
+                adapter_index=self.gvm_adapter.value(),
+                lane_count=self.gvm_lanes.value(),
+            )
+            summary = (
+                f"passed={report.passed} lanes={report.lane_count:,} "
+                f"mismatches={report.mismatches} dispatch={report.elapsed_ms:.3f} ms; "
+                f"{report.message}"
+            )
+            self.console.appendPlainText(f"[gvm] Self-test {summary}")
+            QMessageBox.information(self, "GPU self-test", summary)
+        except Exception as exc:
+            self.console.appendPlainText(f"[gvm] Self-test failed: {exc}")
+            QMessageBox.critical(self, "GPU self-test failed", str(exc))
+        finally:
+            self._refresh_native_runtime_status()
+
+    def _run_native_lane_demo(self) -> None:
+        try:
+            if not self.gpu_vm.active:
+                self._initialize_native_runtime()
+            if not self.gpu_vm.active:
+                return
+            words, elapsed_ms = self.gpu_vm.run_lane_transform(multiplier=3, addend=1)
+            sample = ", ".join(str(value) for value in words[:8])
+            self.console.appendPlainText(
+                f"[gvm] Executed output[lane] = lane * 3 + 1 across {len(words):,} GPU lanes "
+                f"in {elapsed_ms:.3f} ms. First outputs: {sample}"
+            )
+            self._refresh_native_runtime_status()
+        except Exception as exc:
+            self.console.appendPlainText(f"[gvm] Lane demo failed: {exc}")
+            QMessageBox.critical(self, "GPU lane demo failed", str(exc))
+
+    def _browse_and_run_gvm_program(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select GVM program",
+            str(Path("examples").resolve()),
+            "GPU virtual-machine programs (*.gvm.json *.json);;JSON files (*.json)",
+        )
+        if path:
+            self._run_gvm_program(Path(path))
+
+    def _run_gvm_program(self, path: Path) -> None:
+        try:
+            program = GvmProgram.load(path)
+            self.gvm_lanes.setValue(program.lane_count)
+            self.gvm_steps.setValue(program.max_steps_per_lane)
+            current = self.gpu_vm.status()
+            if (
+                not current.active
+                or current.adapter_index != self.gvm_adapter.value()
+                or current.lane_count != program.lane_count
+                or current.max_steps_per_lane != program.max_steps_per_lane
+            ):
+                self.gpu_vm.start(
+                    adapter_index=self.gvm_adapter.value(),
+                    lane_count=program.lane_count,
+                    max_steps_per_lane=program.max_steps_per_lane,
+                )
+            output, elapsed_ms = self.gpu_vm.execute(program.instructions, program.data_words)
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            result_directory = self.settings.data_path().parent / "gvm-results"
+            result_path = result_directory / f"{path.stem}-{stamp}.result.json"
+            program.write_result(result_path, output, elapsed_ms)
+            preview = ", ".join(str(value) for value in output[: program.preview_words])
+            self.console.appendPlainText(
+                f"[gvm] Program '{program.name}' completed: lanes={program.lane_count:,}, "
+                f"instructions={len(program.instructions)}, words={len(output):,}, "
+                f"dispatch={elapsed_ms:.3f} ms. Preview: {preview or '(disabled)'}"
+            )
+            self.console.appendPlainText(f"[gvm] Result saved to {result_path}")
+            self._refresh_native_runtime_status()
+        except Exception as exc:
+            self.console.appendPlainText(f"[gvm] Program failed: {exc}")
+            QMessageBox.critical(self, "GVM program failed", str(exc))
+
+    def _shutdown_native_runtime(self) -> None:
+        try:
+            self.gpu_vm.stop()
+            self.console.appendPlainText("[gvm] Native GPU runtime stopped.")
+        except Exception as exc:
+            QMessageBox.warning(self, "Native GPU shutdown", str(exc))
+        finally:
+            self._refresh_native_runtime_status()
+
+    def _refresh_native_runtime_status(self, error: str = "") -> None:
+        if not hasattr(self, "gvm_status"):
+            return
+        if error:
+            self.gvm_status.setText(f"Native engine error: {error}")
+            return
+        if not self.gpu_vm.available:
+            self.gvm_status.setText(
+                "Native compute ABI unavailable. Build native/bin/gpu_host_runtime.dll with build_native.ps1. "
+                "The Python workstation and XMRig controls remain usable without it."
+            )
+            return
+        snapshot = self.gpu_vm.status()
+        if not snapshot.active:
+            self.gvm_status.setText(
+                f"DLL loaded; compute ABI {self.gpu_vm.abi_version_text}. Engine is stopped. "
+                "Initialize it to reserve a D3D12 compute queue and GPU virtual lanes."
+            )
+            return
+        self.gvm_status.setText(
+            f"Running on {snapshot.adapter_name} (adapter {snapshot.adapter_index}) with "
+            f"{snapshot.lane_count:,} lanes; executions={snapshot.executions:,}; "
+            f"last program={snapshot.last_instruction_count} instructions / "
+            f"{snapshot.last_data_words:,} words / {snapshot.last_elapsed_ms:.3f} ms."
+        )
 
     def _create_task_page(self) -> QWidget:
         page = QWidget()
@@ -624,8 +845,14 @@ class MainWindow(QMainWindow):
 
         self.cuda_loader.setEnabled(uses_cuda)
         self.cuda_devices.setEnabled(uses_cuda)
+        self.cuda_tune_profile.setEnabled(uses_cuda)
+        self.cuda_threads.setEnabled(uses_cuda)
+        self.cuda_blocks.setEnabled(uses_cuda)
+        self.cuda_memory_reserve.setEnabled(uses_cuda)
         self.cuda_bfactor.setEnabled(uses_cuda)
         self.cuda_bsleep.setEnabled(uses_cuda)
+        self.randomx_init_threads.setEnabled(backend in {"pseudo_cuda", "cuda", "opencl"})
+        self.native_isolation.setEnabled(backend in {"pseudo_cuda", "cuda", "opencl"})
         self.pseudo_lanes.setEnabled(backend == "pseudo_cuda")
         self.preflight_dry_run.setEnabled(uses_cuda)
         self.require_cuda_ready.setEnabled(uses_cuda)
@@ -770,7 +997,13 @@ class MainWindow(QMainWindow):
                 opencl_devices=self.opencl_devices.text().strip(),
                 cuda_bfactor_hint=None if self.cuda_bfactor.value() < 0 else self.cuda_bfactor.value(),
                 cuda_bsleep_hint=None if self.cuda_bsleep.value() < 0 else self.cuda_bsleep.value(),
+                cuda_tune_profile=str(self.cuda_tune_profile.currentData()),
+                cuda_threads=self.cuda_threads.value(),
+                cuda_blocks=self.cuda_blocks.value(),
+                cuda_memory_reserve_mib=self.cuda_memory_reserve.value(),
+                randomx_init_threads=self.randomx_init_threads.value(),
                 force_dataset_vram=self.force_dataset_vram.isChecked(),
+                native_isolation=self.native_isolation.isChecked(),
                 pseudo_lane_count=self.pseudo_lanes.value(),
                 preflight_dry_run=self.preflight_dry_run.isChecked(),
                 require_cuda_ready=self.require_cuda_ready.isChecked(),
@@ -823,6 +1056,7 @@ class MainWindow(QMainWindow):
             if self._last_gpus
             else "No NVML/native/nvidia-smi inventory available"
         )
+        self._refresh_native_runtime_status()
 
     def refresh_processes(self) -> None:
         snapshots = self.manager.snapshots()
@@ -900,7 +1134,7 @@ class MainWindow(QMainWindow):
             if command == "help":
                 self.console.appendPlainText(
                     "Commands:\n"
-                    "  gpu\n  ps\n  lanes\n  external\n  suspend <pid>\n  resume <pid>\n"
+                    "  gpu\n  ps\n  lanes\n  gvm status|start [adapter] [lanes]|test [adapter] [lanes]|demo|run <file>|stop\n  external\n  suspend <pid>\n  resume <pid>\n"
                     "  stop <pid>\n  kill <pid>\n"
                     "  priority <pid> idle|below|normal|above|high\n"
                     "  affinity <pid> 20-23\n  clear"
@@ -931,6 +1165,35 @@ class MainWindow(QMainWindow):
                     self.console.appendPlainText(
                         f"{lane.instance_name} GCPU-{lane.lane_index:02d} {lane.state} "
                         f"estimated={lane.estimated_hashrate:,.1f} H/s device={lane.device_label}"
+                    )
+            elif command == "gvm":
+                action = args[0].lower() if args else "status"
+                if action == "status":
+                    self._refresh_native_runtime_status()
+                    self.console.appendPlainText(self.gvm_status.text())
+                elif action == "start":
+                    if len(args) > 1:
+                        self.gvm_adapter.setValue(int(args[1]))
+                    if len(args) > 2:
+                        self.gvm_lanes.setValue(int(args[2]))
+                    self._initialize_native_runtime()
+                elif action == "test":
+                    if len(args) > 1:
+                        self.gvm_adapter.setValue(int(args[1]))
+                    if len(args) > 2:
+                        self.gvm_lanes.setValue(int(args[2]))
+                    self._run_native_self_test()
+                elif action == "demo":
+                    self._run_native_lane_demo()
+                elif action == "run":
+                    if len(args) != 2:
+                        raise ValueError("Usage: gvm run <program.gvm.json>")
+                    self._run_gvm_program(Path(args[1]).expanduser().resolve())
+                elif action == "stop":
+                    self._shutdown_native_runtime()
+                else:
+                    raise ValueError(
+                        "Usage: gvm status|start [adapter] [lanes]|test [adapter] [lanes]|demo|run <file>|stop"
                     )
             elif command == "external":
                 self._scan_external_xmrig()
@@ -971,6 +1234,9 @@ class MainWindow(QMainWindow):
             self.settings.default_affinity = self.control_cores.text().strip()
             self.settings.default_pin_workstation = self.pin_workstation.isChecked()
             self.settings.default_guard_drop_percent = self.max_drop.value()
+            self.settings.default_cuda_tune_profile = str(self.cuda_tune_profile.currentData())
+            self.settings.default_randomx_init_threads = self.randomx_init_threads.value()
+            self.settings.default_native_isolation = self.native_isolation.isChecked()
             self.settings.save()
             self.gpu_timer.setInterval(self.settings.gpu_refresh_ms)
             self.process_timer.setInterval(self.settings.process_refresh_ms)
@@ -995,5 +1261,6 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
         self.manager.shutdown_all()
+        self.gpu_vm.stop()
         self.gpu_monitor.close()
         event.accept()
